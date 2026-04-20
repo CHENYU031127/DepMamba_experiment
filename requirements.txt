@@ -1,0 +1,9 @@
+torch
+numpy
+PyYAML
+tqdm
+wandb
+speechbrain
+einops
+mamba-ssm
+causal-conv1d
