@@ -13,6 +13,10 @@ if_wandb: false
 save_dir: "./save_dir"
 device:
   - "cuda"
+use_local_alignment: false
+use_global_alignment: false
+lambda_local_alignment: 0.05
+lambda_global_alignment: 0.01
 
 # Mamba parameters
 mmmamba:

@@ -39,6 +39,10 @@ def parse_args():
     parser.add_argument("-bs", "--batch_size", type=int)
     parser.add_argument("-lr", "--learning_rate", type=float)
     parser.add_argument("-ds", "--dataset", type=str)
+    parser.add_argument("--use_local_alignment", type=str2bool)
+    parser.add_argument("--use_global_alignment", type=str2bool)
+    parser.add_argument("--lambda_local_alignment", type=float)
+    parser.add_argument("--lambda_global_alignment", type=float)
     
     parser.add_argument("-g", "--gpu", type=str, default="0", help="GPU id(s), e.g. '0' or '0,1' or 'cuda:0,1' or 'cpu'")
     
@@ -59,15 +63,23 @@ def _parse_gpu_arg(gpu_arg: str):
     return ids
 
 
+def _unwrap_model(net):
+    return net.module if isinstance(net, torch.nn.DataParallel) else net
+
+
 def train_epoch(
     net, train_loader, loss_fn, optimizer, device, 
-    current_epoch, total_epochs, tqdm_able
+    current_epoch, total_epochs, tqdm_able,
+    lambda_local_alignment=0.0,
+    lambda_global_alignment=0.0,
 ):
     """One training epoch.
     """
     net.train()
     sample_count = 0
     running_loss = 0.
+    running_local_align_loss = 0.
+    running_global_align_loss = 0.
     correct_count = 0
 
     with tqdm(
@@ -79,13 +91,23 @@ def train_epoch(
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_pred = net(x, mask)
             
-            loss = loss_fn(y_pred, y.to(torch.float32))
+            cls_loss = loss_fn(y_pred, y.to(torch.float32))
+            aux_losses = getattr(_unwrap_model(net), "aux_losses", {})
+            local_align_loss = aux_losses.get("local_align_loss", cls_loss.new_tensor(0.0))
+            global_align_loss = aux_losses.get("global_align_loss", cls_loss.new_tensor(0.0))
+            loss = (
+                cls_loss
+                + lambda_local_alignment * local_align_loss
+                + lambda_global_alignment * global_align_loss
+            )
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
+            running_local_align_loss += local_align_loss.item() * x.shape[0]
+            running_global_align_loss += global_align_loss.item() * x.shape[0]
             # binary classification with only one output neuron
             pred = (y_pred > 0.).int()
             correct_count += (pred == y).sum().item()
@@ -93,11 +115,15 @@ def train_epoch(
             pbar.set_postfix({
                 "loss": running_loss / sample_count,
                 "acc": correct_count / sample_count,
+                "local": running_local_align_loss / sample_count,
+                "global": running_global_align_loss / sample_count,
             })
 
     return {
         "loss": running_loss / sample_count,
         "acc": correct_count / sample_count,
+        "local_align_loss": running_local_align_loss / sample_count,
+        "global_align_loss": running_global_align_loss / sample_count,
     }
 
 
@@ -198,9 +224,14 @@ def main():
         # construct the model
         if args.model == "DepMamba":
             if args.dataset=='lmvd':
-                net = DepMamba(**args.mmmamba_lmvd)# mmmamba_lmvd mmmamba
+                model_kwargs = dict(args.mmmamba_lmvd)
             elif args.dataset=='dvlog':
-                net = DepMamba(**args.mmmamba)# mmmamba_lmvd mmmamba
+                model_kwargs = dict(args.mmmamba)
+            model_kwargs.update({
+                "use_local_alignment": args.use_local_alignment,
+                "use_global_alignment": args.use_global_alignment,
+            })
+            net = DepMamba(**model_kwargs)# mmmamba_lmvd mmmamba
         else:#if args.model == "MAMBA":
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(args.device[0])
@@ -239,7 +270,9 @@ def main():
             for epoch in range(args.epochs):
                 train_results = train_epoch(
                     net, train_loader, loss_fn, optimizer, 
-                    args.device[0], epoch, args.epochs, args.tqdm_able
+                    args.device[0], epoch, args.epochs, args.tqdm_able,
+                    args.lambda_local_alignment,
+                    args.lambda_global_alignment,
                 )
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
 
@@ -252,6 +285,8 @@ def main():
                     wandb.log({
                         "loss/train": train_results["loss"],
                         "acc/train": train_results["acc"],
+                        "loss/local_align": train_results["local_align_loss"],
+                        "loss/global_align": train_results["global_align_loss"],
                         "loss/val": val_results["loss"],
                         "acc/val": val_results["acc"],
                         "precision/val": val_results["precision"],

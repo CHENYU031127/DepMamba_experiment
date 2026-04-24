@@ -341,10 +341,63 @@ class EnSSM(nn.Module):
 
         return out
 
+
+def masked_temporal_mean(x, padding_mask=None, eps=1e-8):
+    if padding_mask is None:
+        return x.mean(dim=1)
+    mask = padding_mask.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+    denom = mask.sum(dim=1).clamp_min(eps)
+    return (x * mask).sum(dim=1) / denom
+
+
+def local_cosine_alignment_loss(xa, xv, padding_mask=None, eps=1e-8):
+    xa = F.normalize(xa, p=2, dim=-1, eps=eps)
+    xv = F.normalize(xv, p=2, dim=-1, eps=eps)
+    frame_loss = 1.0 - (xa * xv).sum(dim=-1)
+    if padding_mask is None:
+        return frame_loss.mean()
+    mask = padding_mask.to(dtype=frame_loss.dtype, device=frame_loss.device)
+    return (frame_loss * mask).sum() / mask.sum().clamp_min(eps)
+
+
+def rbf_mmd_loss(x, y, kernel_mul=2.0, kernel_num=5, fixed_sigma=None, eps=1e-8):
+    batch_size = x.size(0)
+    if batch_size == 0:
+        return x.new_tensor(0.0)
+
+    total = torch.cat([x, y], dim=0)
+    sq_dist = torch.cdist(total, total, p=2).pow(2)
+
+    if fixed_sigma is None:
+        denom = max(total.size(0) * total.size(0) - total.size(0), 1)
+        bandwidth = sq_dist.detach().sum() / denom
+    else:
+        bandwidth = x.new_tensor(float(fixed_sigma))
+    bandwidth = bandwidth.clamp_min(eps)
+    bandwidth = bandwidth / (kernel_mul ** (kernel_num // 2))
+
+    kernels = 0.0
+    for i in range(kernel_num):
+        kernels = kernels + torch.exp(
+            -sq_dist / ((bandwidth * (kernel_mul ** i)).clamp_min(eps))
+        )
+
+    xx = kernels[:batch_size, :batch_size]
+    yy = kernels[batch_size:, batch_size:]
+    xy = kernels[:batch_size, batch_size:]
+    yx = kernels[batch_size:, :batch_size]
+    return xx.mean() + yy.mean() - xy.mean() - yx.mean()
+
 class DepMamba(BaseNet):
 
-    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
+    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None, use_local_alignment=False, use_global_alignment=False, mmd_kernel_mul=2.0, mmd_kernel_num=5, mmd_fixed_sigma=None):
         super().__init__()
+        self.use_local_alignment = use_local_alignment
+        self.use_global_alignment = use_global_alignment
+        self.mmd_kernel_mul = mmd_kernel_mul
+        self.mmd_kernel_num = mmd_kernel_num
+        self.mmd_fixed_sigma = mmd_fixed_sigma
+        self.aux_losses = {}
 
         self.cossm_encoder = CoSSM(num_layers,
                                          mm_input_size,
@@ -381,6 +434,26 @@ class DepMamba(BaseNet):
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
+
+        zero = x.new_tensor(0.0)
+        self.aux_losses = {
+            "local_align_loss": zero,
+            "global_align_loss": zero,
+        }
+        if self.use_local_alignment:
+            self.aux_losses["local_align_loss"] = local_cosine_alignment_loss(
+                xa, xv, padding_mask
+            )
+        if self.use_global_alignment:
+            za = masked_temporal_mean(xa, padding_mask)
+            zv = masked_temporal_mean(xv, padding_mask)
+            self.aux_losses["global_align_loss"] = rbf_mmd_loss(
+                za,
+                zv,
+                kernel_mul=self.mmd_kernel_mul,
+                kernel_num=self.mmd_kernel_num,
+                fixed_sigma=self.mmd_fixed_sigma,
+            )
 
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
 
