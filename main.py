@@ -67,6 +67,28 @@ def _unwrap_model(net):
     return net.module if isinstance(net, torch.nn.DataParallel) else net
 
 
+def _format_for_path(value):
+    text = str(value)
+    return (
+        text.replace("-", "m")
+        .replace(".", "p")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+
+def build_experiment_name(args):
+    local_tag = "local1" if args.use_local_alignment else "local0"
+    global_tag = "global1" if args.use_global_alignment else "global0"
+    lambda_local = _format_for_path(args.lambda_local_alignment)
+    lambda_global = _format_for_path(args.lambda_global_alignment)
+    return (
+        f"{args.dataset}_{args.model}_"
+        f"{local_tag}_ll{lambda_local}_"
+        f"{global_tag}_lg{lambda_global}"
+    )
+
+
 def train_epoch(
     net, train_loader, loss_fn, optimizer, device, 
     current_epoch, total_epochs, tqdm_able,
@@ -206,10 +228,12 @@ def main():
     print(f"[Device] primary={primary_device}, data_parallel_ids={dp_device_ids}")
 
     args.data_dir = os.path.join(args.data_dir,args.dataset)
+    experiment_name = build_experiment_name(args)
+    print(f"[Experiment] {experiment_name}")
 
     for i_iter in range(3):
         if args.if_wandb:
-            wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
+            wandb_run_name = f"{experiment_name}-{args.train_gender}-{args.test_gender}-iter{i_iter}"
             wandb.init(
                 project="mamnba_ad", config=args, name=wandb_run_name,
             )
@@ -217,9 +241,15 @@ def main():
         print(args)
         
         # Build Save Dir
-        os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}", exist_ok=True)
-        os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/samples", exist_ok=True)
-        os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints", exist_ok=True)
+        experiment_dir = os.path.join(args.save_dir, f"{experiment_name}_{i_iter}")
+        samples_dir = os.path.join(experiment_dir, "samples")
+        checkpoints_dir = os.path.join(experiment_dir, "checkpoints")
+        checkpoint_path = os.path.join(checkpoints_dir, "best_model.pt")
+        result_path = os.path.join("./results", f"{experiment_name}_{i_iter}.txt")
+        os.makedirs(experiment_dir, exist_ok=True)
+        os.makedirs(samples_dir, exist_ok=True)
+        os.makedirs(checkpoints_dir, exist_ok=True)
+        print(f"[Paths] checkpoint={checkpoint_path}, result={result_path}")
 
         # construct the model
         if args.model == "DepMamba":
@@ -279,7 +309,7 @@ def main():
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
-                    torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                    torch.save(net.state_dict(), checkpoint_path)
 
                 if args.if_wandb:
                     wandb.log({
@@ -298,7 +328,7 @@ def main():
         # load the best model for testing
         with torch.no_grad():
             net.load_state_dict(
-                torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0])
+                torch.load(checkpoint_path, map_location=args.device[0])
             )
             net.eval()
             test_results = val(net, test_loader, loss_fn, args.device[0],args.tqdm_able)
@@ -306,13 +336,13 @@ def main():
             print(test_results)
 
             os.makedirs("./results", exist_ok=True)
-            with open(f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt','w') as f:    
+            with open(result_path,'w') as f:    
                 test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{(test_results["acc"] + test_results["precision"]+ test_results["recall"]+ test_results["f1"])/4.0}'
                 f.write(test_result_str)         
 
     if args.if_wandb:
         artifact = wandb.Artifact("best_model", type="model")
-        artifact.add_file(f"{args.save_dir}/{args.model}/checkpoints/best_model.pt")
+        artifact.add_file(checkpoint_path)
         wandb.run.summary["acc/best_val_acc"] = best_val_acc
         wandb.log_artifact(artifact)
         wandb.run.summary["acc/test_acc"] = test_results["acc"]
