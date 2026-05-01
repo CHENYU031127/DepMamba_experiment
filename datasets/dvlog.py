@@ -58,7 +58,12 @@ class DVlog(data.Dataset):
                             self.features.append(feature[t_start:t_start+f_length,:])
                             # print(feature[t_start:t_start+f_length,:].shape)
 
-        print(f"ALL:{len(self.labels)}, Positive:{np.sum(self.labels)}, Negative:{len(self.labels)-np.sum(self.labels)}")
+        positive = int(np.sum(self.labels))
+        negative = len(self.labels) - positive
+        print(
+            f"[Data] {self.fold:<5} total={len(self.labels)}, "
+            f"positive={positive}, negative={negative}"
+        )
 
     def is_sample(self, sample) -> bool:
         gender, fold = sample[3], sample[4]

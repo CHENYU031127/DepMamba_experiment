@@ -238,7 +238,6 @@ class CoSSM(nn.Module):
         mamba_config=None
     ):
         super().__init__()
-        print(f'dropout={str(dropout)} is not used in Mamba.')
         prev_input_size = input_size
 
         cnn_list = []
@@ -299,7 +298,6 @@ class EnSSM(nn.Module):
         mamba_config=None
     ):
         super().__init__()
-        print(f'dropout={str(dropout)} is not used in Mamba.')
         prev_input_size = input_size
 
         cnn_list = []
@@ -360,6 +358,95 @@ def local_cosine_alignment_loss(xa, xv, padding_mask=None, eps=1e-8):
     return (frame_loss * mask).sum() / mask.sum().clamp_min(eps)
 
 
+def _directional_window_soft_alignment_loss(
+    query,
+    key,
+    query_mask=None,
+    key_mask=None,
+    window_size=4,
+    temperature=0.1,
+    eps=1e-8,
+):
+    batch_size, query_steps, _ = query.shape
+    key_steps = key.size(1)
+    query_n = F.normalize(query, p=2, dim=-1, eps=eps)
+    key_n = F.normalize(key, p=2, dim=-1, eps=eps)
+
+    if query_mask is None:
+        query_mask = torch.ones(
+            batch_size, query_steps, dtype=torch.bool, device=query.device
+        )
+    else:
+        query_mask = query_mask.to(dtype=torch.bool, device=query.device)
+
+    if key_mask is None:
+        key_mask = torch.ones(
+            batch_size, key_steps, dtype=torch.bool, device=key.device
+        )
+    else:
+        key_mask = key_mask.to(dtype=torch.bool, device=key.device)
+
+    frame_losses = []
+    valid_queries = []
+    temperature = max(float(temperature), eps)
+    window_size = max(int(window_size), 0)
+
+    for t in range(query_steps):
+        left = max(0, t - window_size)
+        right = min(key_steps, t + window_size + 1)
+
+        q = query_n[:, t:t + 1, :]
+        k = key_n[:, left:right, :]
+        key_window_mask = key_mask[:, left:right]
+
+        sim = torch.sum(q * k, dim=-1)
+        sim = sim.masked_fill(~key_window_mask, -1e9)
+        weights = torch.softmax(sim / temperature, dim=-1)
+
+        aligned_key = torch.sum(weights.unsqueeze(-1) * k, dim=1)
+        aligned_key = F.normalize(aligned_key, p=2, dim=-1, eps=eps)
+        loss_t = 1.0 - torch.sum(query_n[:, t, :] * aligned_key, dim=-1)
+
+        valid_t = query_mask[:, t] & key_window_mask.any(dim=1)
+        frame_losses.append(loss_t)
+        valid_queries.append(valid_t)
+
+    frame_loss = torch.stack(frame_losses, dim=1)
+    valid_mask = torch.stack(valid_queries, dim=1).to(
+        dtype=frame_loss.dtype, device=frame_loss.device
+    )
+    return (frame_loss * valid_mask).sum() / valid_mask.sum().clamp_min(eps)
+
+
+def window_soft_alignment_loss(
+    xa,
+    xv,
+    padding_mask=None,
+    window_size=4,
+    temperature=0.1,
+    eps=1e-8,
+):
+    a2v_loss = _directional_window_soft_alignment_loss(
+        xa,
+        xv,
+        query_mask=padding_mask,
+        key_mask=padding_mask,
+        window_size=window_size,
+        temperature=temperature,
+        eps=eps,
+    )
+    v2a_loss = _directional_window_soft_alignment_loss(
+        xv,
+        xa,
+        query_mask=padding_mask,
+        key_mask=padding_mask,
+        window_size=window_size,
+        temperature=temperature,
+        eps=eps,
+    )
+    return 0.5 * (a2v_loss + v2a_loss)
+
+
 def rbf_mmd_loss(x, y, kernel_mul=2.0, kernel_num=5, fixed_sigma=None, eps=1e-8):
     batch_size = x.size(0)
     if batch_size == 0:
@@ -390,14 +477,22 @@ def rbf_mmd_loss(x, y, kernel_mul=2.0, kernel_num=5, fixed_sigma=None, eps=1e-8)
 
 class DepMamba(BaseNet):
 
-    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None, use_local_alignment=False, use_global_alignment=False, mmd_kernel_mul=2.0, mmd_kernel_num=5, mmd_fixed_sigma=None):
+    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None, use_local_alignment=False, use_global_alignment=False, local_alignment_mode="window_soft", local_alignment_window=4, local_alignment_temperature=0.1, mmd_kernel_mul=2.0, mmd_kernel_num=5, mmd_fixed_sigma=None):
         super().__init__()
         self.use_local_alignment = use_local_alignment
         self.use_global_alignment = use_global_alignment
+        self.local_alignment_mode = str(local_alignment_mode).lower()
+        self.local_alignment_window = local_alignment_window
+        self.local_alignment_temperature = local_alignment_temperature
         self.mmd_kernel_mul = mmd_kernel_mul
         self.mmd_kernel_num = mmd_kernel_num
         self.mmd_fixed_sigma = mmd_fixed_sigma
         self.aux_losses = {}
+
+        if self.local_alignment_mode not in ("hard", "window_soft"):
+            raise ValueError(
+                "local_alignment_mode must be either 'hard' or 'window_soft'"
+            )
 
         self.cossm_encoder = CoSSM(num_layers,
                                          mm_input_size,
@@ -441,9 +536,18 @@ class DepMamba(BaseNet):
             "global_align_loss": zero,
         }
         if self.use_local_alignment:
-            self.aux_losses["local_align_loss"] = local_cosine_alignment_loss(
-                xa, xv, padding_mask
-            )
+            if self.local_alignment_mode == "hard":
+                self.aux_losses["local_align_loss"] = local_cosine_alignment_loss(
+                    xa, xv, padding_mask
+                )
+            elif self.local_alignment_mode == "window_soft":
+                self.aux_losses["local_align_loss"] = window_soft_alignment_loss(
+                    xa,
+                    xv,
+                    padding_mask,
+                    window_size=self.local_alignment_window,
+                    temperature=self.local_alignment_temperature,
+                )
         if self.use_global_alignment:
             za = masked_temporal_mean(xa, padding_mask)
             zv = masked_temporal_mean(xv, padding_mask)

@@ -43,6 +43,9 @@ def parse_args():
     parser.add_argument("--use_global_alignment", type=str2bool)
     parser.add_argument("--lambda_local_alignment", type=float)
     parser.add_argument("--lambda_global_alignment", type=float)
+    parser.add_argument("--local_alignment_mode", type=str)
+    parser.add_argument("--local_alignment_window", type=int)
+    parser.add_argument("--local_alignment_temperature", type=float)
     
     parser.add_argument("-g", "--gpu", type=str, default="0", help="GPU id(s), e.g. '0' or '0,1' or 'cuda:0,1' or 'cpu'")
     
@@ -82,11 +85,93 @@ def build_experiment_name(args):
     global_tag = "global1" if args.use_global_alignment else "global0"
     lambda_local = _format_for_path(args.lambda_local_alignment)
     lambda_global = _format_for_path(args.lambda_global_alignment)
+    local_mode = str(args.local_alignment_mode).lower()
+    local_window = _format_for_path(args.local_alignment_window)
+    local_temperature = _format_for_path(args.local_alignment_temperature)
+    local_detail = f"{local_tag}_{local_mode}_w{local_window}_t{local_temperature}"
     return (
         f"{args.dataset}_{args.model}_"
-        f"{local_tag}_ll{lambda_local}_"
+        f"{local_detail}_ll{lambda_local}_"
         f"{global_tag}_lg{lambda_global}"
     )
+
+
+def _metric_avg(results):
+    return (
+        results["acc"]
+        + results["precision"]
+        + results["recall"]
+        + results["f1"]
+    ) / 4.0
+
+
+def _fmt_metric(value):
+    return f"{value:.4f}"
+
+
+def print_experiment_header(args, experiment_name, primary_device, dp_device_ids):
+    width = 72
+    print("=" * width)
+    print("DepMamba Experiment")
+    print("=" * width)
+    print(f"{'Dataset':<13}: {args.dataset}")
+    print(f"{'Model':<13}: {args.model}")
+    print(f"{'Train/Test':<13}: {args.train_gender} -> {args.test_gender}")
+    print(f"{'Epochs':<13}: {args.epochs}")
+    print(f"{'Batch size':<13}: {args.batch_size}")
+    print(f"{'LR':<13}: {args.learning_rate}")
+    print(f"{'Device':<13}: primary={primary_device}, data_parallel_ids={dp_device_ids}")
+    print(
+        f"{'Alignment':<13}: "
+        f"local={args.use_local_alignment}, global={args.use_global_alignment}"
+    )
+    print(
+        f"{'Local mode':<13}: "
+        f"{args.local_alignment_mode}, "
+        f"window={args.local_alignment_window}, "
+        f"temperature={args.local_alignment_temperature}"
+    )
+    print(
+        f"{'Loss weights':<13}: "
+        f"local={args.lambda_local_alignment}, global={args.lambda_global_alignment}"
+    )
+    print(f"{'Experiment':<13}: {experiment_name}")
+    print("=" * width)
+
+
+def print_run_header(i_iter, total_runs, checkpoint_path, result_path):
+    print("")
+    print(f"[Run {i_iter + 1}/{total_runs}]")
+    print(f"{'Checkpoint':<11}: {checkpoint_path}")
+    print(f"{'Result':<11}: {result_path}")
+
+
+def print_test_results(results):
+    print("")
+    print("[Test Results]")
+    print(f"{'Loss':<10}: {_fmt_metric(results['loss'])}")
+    print(f"{'Accuracy':<10}: {_fmt_metric(results['acc'])}")
+    print(f"{'Precision':<10}: {_fmt_metric(results['precision'])}")
+    print(f"{'Recall':<10}: {_fmt_metric(results['recall'])}")
+    print(f"{'F1':<10}: {_fmt_metric(results['f1'])}")
+    print(f"{'Avg':<10}: {_fmt_metric(_metric_avg(results))}")
+
+
+def print_final_summary(run_results):
+    if not run_results:
+        return
+    print("")
+    print("[Summary]")
+    print(f"{'Run':<5}{'Acc':>9}{'Prec':>9}{'Recall':>9}{'F1':>9}{'Avg':>9}")
+    for i, results in enumerate(run_results):
+        print(
+            f"{i:<5}"
+            f"{_fmt_metric(results['acc']):>9}"
+            f"{_fmt_metric(results['precision']):>9}"
+            f"{_fmt_metric(results['recall']):>9}"
+            f"{_fmt_metric(results['f1']):>9}"
+            f"{_fmt_metric(_metric_avg(results)):>9}"
+        )
 
 
 def train_epoch(
@@ -100,8 +185,11 @@ def train_epoch(
     net.train()
     sample_count = 0
     running_loss = 0.
+    running_cls_loss = 0.
     running_local_align_loss = 0.
     running_global_align_loss = 0.
+    running_weighted_local_align_loss = 0.
+    running_weighted_global_align_loss = 0.
     correct_count = 0
 
     with tqdm(
@@ -117,10 +205,12 @@ def train_epoch(
             aux_losses = getattr(_unwrap_model(net), "aux_losses", {})
             local_align_loss = aux_losses.get("local_align_loss", cls_loss.new_tensor(0.0))
             global_align_loss = aux_losses.get("global_align_loss", cls_loss.new_tensor(0.0))
+            weighted_local_align_loss = lambda_local_alignment * local_align_loss
+            weighted_global_align_loss = lambda_global_alignment * global_align_loss
             loss = (
                 cls_loss
-                + lambda_local_alignment * local_align_loss
-                + lambda_global_alignment * global_align_loss
+                + weighted_local_align_loss
+                + weighted_global_align_loss
             )
             loss.backward()
             optimizer.step()
@@ -128,24 +218,33 @@ def train_epoch(
 
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
+            running_cls_loss += cls_loss.item() * x.shape[0]
             running_local_align_loss += local_align_loss.item() * x.shape[0]
             running_global_align_loss += global_align_loss.item() * x.shape[0]
+            running_weighted_local_align_loss += weighted_local_align_loss.item() * x.shape[0]
+            running_weighted_global_align_loss += weighted_global_align_loss.item() * x.shape[0]
             # binary classification with only one output neuron
             pred = (y_pred > 0.).int()
             correct_count += (pred == y).sum().item()
 
             pbar.set_postfix({
-                "loss": running_loss / sample_count,
+                "total": running_loss / sample_count,
+                "cls": running_cls_loss / sample_count,
                 "acc": correct_count / sample_count,
                 "local": running_local_align_loss / sample_count,
+                "w_local": running_weighted_local_align_loss / sample_count,
                 "global": running_global_align_loss / sample_count,
+                "w_global": running_weighted_global_align_loss / sample_count,
             })
 
     return {
         "loss": running_loss / sample_count,
+        "cls_loss": running_cls_loss / sample_count,
         "acc": correct_count / sample_count,
         "local_align_loss": running_local_align_loss / sample_count,
         "global_align_loss": running_global_align_loss / sample_count,
+        "weighted_local_align_loss": running_weighted_local_align_loss / sample_count,
+        "weighted_global_align_loss": running_weighted_global_align_loss / sample_count,
     }
 
 
@@ -225,20 +324,19 @@ def main():
         primary_device = torch.device(f"cuda:{gpu_ids[0]}")
         dp_device_ids = gpu_ids if len(gpu_ids) > 1 else None
 
-    print(f"[Device] primary={primary_device}, data_parallel_ids={dp_device_ids}")
-
     args.data_dir = os.path.join(args.data_dir,args.dataset)
     experiment_name = build_experiment_name(args)
-    print(f"[Experiment] {experiment_name}")
+    print_experiment_header(args, experiment_name, primary_device, dp_device_ids)
 
-    for i_iter in range(3):
+    total_runs = 3
+    run_results = []
+    for i_iter in range(total_runs):
         if args.if_wandb:
             wandb_run_name = f"{experiment_name}-{args.train_gender}-{args.test_gender}-iter{i_iter}"
             wandb.init(
                 project="mamnba_ad", config=args, name=wandb_run_name,
             )
             args = wandb.config
-        print(args)
         
         # Build Save Dir
         experiment_dir = os.path.join(args.save_dir, f"{experiment_name}_{i_iter}")
@@ -249,7 +347,7 @@ def main():
         os.makedirs(experiment_dir, exist_ok=True)
         os.makedirs(samples_dir, exist_ok=True)
         os.makedirs(checkpoints_dir, exist_ok=True)
-        print(f"[Paths] checkpoint={checkpoint_path}, result={result_path}")
+        print_run_header(i_iter, total_runs, checkpoint_path, result_path)
 
         # construct the model
         if args.model == "DepMamba":
@@ -260,6 +358,9 @@ def main():
             model_kwargs.update({
                 "use_local_alignment": args.use_local_alignment,
                 "use_global_alignment": args.use_global_alignment,
+                "local_alignment_mode": args.local_alignment_mode,
+                "local_alignment_window": args.local_alignment_window,
+                "local_alignment_temperature": args.local_alignment_temperature,
             })
             net = DepMamba(**model_kwargs)# mmmamba_lmvd mmmamba
         else:#if args.model == "MAMBA":
@@ -314,9 +415,12 @@ def main():
                 if args.if_wandb:
                     wandb.log({
                         "loss/train": train_results["loss"],
+                        "loss/cls": train_results["cls_loss"],
                         "acc/train": train_results["acc"],
                         "loss/local_align": train_results["local_align_loss"],
                         "loss/global_align": train_results["global_align_loss"],
+                        "loss/weighted_local_align": train_results["weighted_local_align_loss"],
+                        "loss/weighted_global_align": train_results["weighted_global_align_loss"],
                         "loss/val": val_results["loss"],
                         "acc/val": val_results["acc"],
                         "precision/val": val_results["precision"],
@@ -332,13 +436,15 @@ def main():
             )
             net.eval()
             test_results = val(net, test_loader, loss_fn, args.device[0],args.tqdm_able)
-            print("Test results:")
-            print(test_results)
+            print_test_results(test_results)
+            run_results.append(test_results)
 
             os.makedirs("./results", exist_ok=True)
             with open(result_path,'w') as f:    
-                test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{(test_results["acc"] + test_results["precision"]+ test_results["recall"]+ test_results["f1"])/4.0}'
+                test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{_metric_avg(test_results)}'
                 f.write(test_result_str)         
+
+    print_final_summary(run_results)
 
     if args.if_wandb:
         artifact = wandb.Artifact("best_model", type="model")

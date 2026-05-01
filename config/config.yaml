@@ -17,6 +17,9 @@ use_local_alignment: false
 use_global_alignment: false
 lambda_local_alignment: 0.05
 lambda_global_alignment: 0.01
+local_alignment_mode: window_soft # hard or window_soft
+local_alignment_window: 4
+local_alignment_temperature: 0.1
 
 # Mamba parameters
 mmmamba:
